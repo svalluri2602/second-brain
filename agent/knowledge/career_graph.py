@@ -303,6 +303,77 @@ def query_companies_by_portal(portal_name: str):
     return results
 
 
+# ── Skill extraction ──────────────────────────────────────────────────────────
+
+# Common tech skills to detect in job titles — zero API cost, instant
+SKILL_KEYWORDS = [
+    "Python", "JavaScript", "TypeScript", "Java", "Go", "Rust", "C++", "Ruby", "Scala",
+    "React", "Next.js", "Vue", "Angular", "Node.js", "FastAPI", "Django", "Flask",
+    "LangChain", "LangGraph", "LangSmith", "LlamaIndex", "Haystack",
+    "OpenAI", "Anthropic", "Claude", "GPT", "Gemini",
+    "RAG", "GraphRAG", "Embeddings", "Fine-tuning", "RLHF", "Prompt Engineering",
+    "AI Agent", "Agentic", "Multi-agent", "Autonomous Agent",
+    "Neo4j", "PostgreSQL", "MySQL", "MongoDB", "Redis", "SQLite", "Pinecone", "Qdrant",
+    "AWS", "GCP", "Azure", "Docker", "Kubernetes", "Terraform",
+    "Machine Learning", "Deep Learning", "NLP", "Computer Vision",
+    "PyTorch", "TensorFlow", "Hugging Face", "scikit-learn",
+    "Playwright", "Selenium", "Web Scraping",
+    "GraphQL", "REST", "API", "Microservices",
+    "Git", "CI/CD", "GitHub Actions",
+    "SQL", "ETL", "Data Pipeline", "Spark",
+    "LLM", "Vector Database", "Knowledge Graph",
+]
+
+
+def extract_skills_from_titles(driver):
+    """Scan all Role titles for known skills, create Skill nodes + REQUIRES edges."""
+    print("Extracting skills from job titles...")
+
+    roles = run(driver, "MATCH (r:Role) RETURN r.url AS url, r.title AS title")
+
+    linked = 0
+    for role in roles:
+        title = (role.get("title") or "").lower()
+        url   = role.get("url", "")
+        if not url:
+            continue
+
+        for skill in SKILL_KEYWORDS:
+            if skill.lower() in title:
+                run(driver, """
+                    MERGE (s:Skill {name: $skill})
+                    WITH s
+                    MATCH (r:Role {url: $url})
+                    MERGE (r)-[:REQUIRES]->(s)
+                """, skill=skill, url=url)
+                linked += 1
+
+    print(f"  Skill extraction done — {linked} Role→Skill links created")
+
+
+def show_skill_gap(driver):
+    """Compare skills your GitHub demonstrates vs skills jobs require."""
+    results = run(driver, """
+        MATCH (cb:Codebase)-[:DEMONSTRATES]->(s:Skill)<-[:REQUIRES]-(r:Role)
+        RETURN s.name AS skill,
+               count(DISTINCT r) AS jobs_requiring,
+               collect(DISTINCT cb.name)[0..3] AS your_repos
+        ORDER BY jobs_requiring DESC
+        LIMIT 20
+    """)
+
+    if not results:
+        print("  No skill matches yet — run github_connector on your repos first")
+        return
+
+    print("\n── Skill Gap Report ──────────────────────────────────────────")
+    print(f"  {'Skill':<25} {'Jobs requiring':<15} {'Your repos'}")
+    print(f"  {'─'*25} {'─'*15} {'─'*30}")
+    for r in results:
+        repos = ", ".join(r["your_repos"])
+        print(f"  {r['skill']:<25} {r['jobs_requiring']:<15} {repos}")
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def ingest_all():
@@ -311,6 +382,8 @@ def ingest_all():
     ingest_scan_history(driver)
     ingest_applications(driver)
     ingest_reports(driver)
+    extract_skills_from_titles(driver)
+    show_skill_gap(driver)
     driver.close()
     print("\nIngestion complete.")
 

@@ -62,14 +62,83 @@ Neo4j graph schema:
 - (Application {num, date, company, role, score, status, notes})
 - (Codebase {url, name, description, languages, explanation, resume_bullets}) -[:DEMONSTRATES]-> (Skill)
 - (Codebase) -[:HAS_COMMIT]-> (GitCommit {sha, message, date})
-- (Skill) -[:RELEVANT_TO]-> (Application)
 
 Canonical application statuses: Evaluated, Applied, Responded, Interview, Offer, Rejected, Discarded, SKIP
+
+Example queries:
+- All applications:
+  MATCH (a:Application) RETURN a.num, a.company, a.role, a.score, a.status ORDER BY a.score DESC
+
+- Skills my GitHub demonstrates:
+  MATCH (cb:Codebase)-[:DEMONSTRATES]->(s:Skill) RETURN cb.name AS repo, collect(s.name) AS skills
+
+- Gap detection (my GitHub skills vs job requirements — do NOT add Application joins):
+  MATCH (cb:Codebase)-[:DEMONSTRATES]->(ds:Skill)
+  MATCH (rs:Skill)<-[:REQUIRES]-(r:Role)
+  WHERE toLower(rs.name) CONTAINS toLower(ds.name) OR toLower(ds.name) CONTAINS toLower(rs.name)
+  RETURN rs.name AS skill, count(DISTINCT r) AS jobs_needing_it, collect(DISTINCT cb.name)[0..2] AS your_repos
+  ORDER BY jobs_needing_it DESC LIMIT 10
+
+- Companies by portal:
+  MATCH (c:Company)-[:POSTED]->(r:Role)-[:SURFACED_BY]->(p:Portal {name: 'greenhouse'})
+  RETURN c.name, r.title LIMIT 10
+
+- My codebases:
+  MATCH (cb:Codebase) RETURN cb.name, cb.explanation, cb.languages, cb.resume_bullets
 """
 
 
+PREBUILT_QUERIES = {
+    "gap": """
+        MATCH (cb:Codebase)-[:DEMONSTRATES]->(s:Skill)<-[:REQUIRES]-(r:Role)
+        RETURN s.name AS skill, count(DISTINCT r) AS jobs_needing_it,
+               collect(DISTINCT cb.name)[0..2] AS your_repos
+        ORDER BY jobs_needing_it DESC LIMIT 15
+    """,
+    "applications": """
+        MATCH (a:Application)
+        RETURN a.num AS num, a.company AS company, a.role AS role,
+               a.score AS score, a.status AS status, a.notes AS notes
+        ORDER BY a.score DESC
+    """,
+    "codebases": """
+        MATCH (cb:Codebase)
+        RETURN cb.name AS name, cb.explanation AS explanation,
+               cb.languages AS languages, cb.resume_bullets AS bullets,
+               cb.complexity AS complexity
+    """,
+    "skills": """
+        MATCH (cb:Codebase)-[:DEMONSTRATES]->(s:Skill)
+        RETURN cb.name AS repo, collect(s.name) AS skills
+    """,
+    "companies": """
+        MATCH (c:Company)-[:POSTED]->(r:Role)
+        RETURN c.name AS company, count(r) AS roles
+        ORDER BY roles DESC LIMIT 20
+    """,
+}
+
+def _route_prebuilt(question: str) -> str | None:
+    q = question.lower()
+    if any(w in q for w in ["gap", "match", "require", "need", "missing", "qualify"]):
+        return PREBUILT_QUERIES["gap"]
+    if any(w in q for w in ["application", "applied", "pipeline", "status", "score"]):
+        return PREBUILT_QUERIES["applications"]
+    if any(w in q for w in ["built", "project", "codebase", "repo", "github"]):
+        return PREBUILT_QUERIES["codebases"]
+    if any(w in q for w in ["skill", "technology", "stack", "know", "experience"]):
+        return PREBUILT_QUERIES["skills"]
+    if any(w in q for w in ["compan", "employer", "who is hiring"]):
+        return PREBUILT_QUERIES["companies"]
+    return None
+
+
 def generate_cypher_node(state: ChatState) -> dict:
-    """Convert natural language question to Cypher query."""
+    """Route to pre-built Cypher or generate dynamically."""
+    prebuilt = _route_prebuilt(state["question"])
+    if prebuilt:
+        return {"cypher": prebuilt}
+
     response = client.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=400,
@@ -77,21 +146,23 @@ def generate_cypher_node(state: ChatState) -> dict:
             "role": "user",
             "content": f"""{SCHEMA_CONTEXT}
 
-Convert this question to a Cypher query. Return ONLY the Cypher query, nothing else.
-If the question cannot be answered from the graph, return: SKIP
+Convert this question to a Cypher query. Return ONLY the Cypher, nothing else.
+If unanswerable from the graph, return: SKIP
 
 Question: {state['question']}
 
 Rules:
-- Use MATCH, WHERE, RETURN
-- Always LIMIT to 20 results max
-- For skills use toLower() for matching
-- Return readable field names"""
+- ONLY use relationships defined in the schema above
+- LIMIT to 20 max
+- toLower() for string matching"""
         }]
     )
     cypher = response.content[0].text.strip()
-    if cypher.startswith("```"):
-        cypher = cypher.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+    if "```" in cypher:
+        cypher = cypher.split("```")[1]
+        if cypher.lower().startswith("cypher"):
+            cypher = cypher[6:]
+        cypher = cypher.strip()
     return {"cypher": cypher}
 
 

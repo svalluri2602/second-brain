@@ -24,6 +24,7 @@ from typing import Optional
 from dotenv import load_dotenv
 from neo4j import GraphDatabase
 from anthropic import Anthropic
+from agent.knowledge.career_graph import SKILL_KEYWORDS
 
 load_dotenv()
 
@@ -33,6 +34,43 @@ NEO4J_URI  = os.getenv("NEO4J_URI",  "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASS = os.getenv("NEO4J_PASS", "secondbrain")
 GH_TOKEN   = os.getenv("GITHUB_TOKEN", "")
+
+
+# ── Skill normalization ───────────────────────────────────────────────────────
+
+def _word_tokens(text: str) -> set[str]:
+    """Split text into lowercase word tokens on common delimiters."""
+    return set(re.split(r"[\s\-/_.,()+]+", text.lower()))
+
+
+def normalize_skills(raw_skills: list, languages: list) -> list:
+    """
+    Match Claude's free-form skill names against SKILL_KEYWORDS using
+    word-boundary matching to avoid 'Go' matching 'Django', etc.
+    GitHub-detected languages are matched by exact case-insensitive comparison.
+    """
+    normalized = set()
+
+    # GitHub API languages are exact — match directly
+    for lang in languages:
+        for kw in SKILL_KEYWORDS:
+            if kw.lower() == lang.lower():
+                normalized.add(kw)
+                break
+
+    # For Claude's free-form skills use word-token matching
+    for raw in raw_skills:
+        raw_tokens = _word_tokens(raw)
+        for kw in SKILL_KEYWORDS:
+            kw_tokens = _word_tokens(kw)
+            # All tokens of the keyword must appear in the raw skill tokens
+            if kw_tokens and kw_tokens.issubset(raw_tokens):
+                normalized.add(kw)
+            # Or all tokens of raw appear in keyword tokens (reverse)
+            elif raw_tokens and raw_tokens.issubset(kw_tokens):
+                normalized.add(kw)
+
+    return sorted(normalized)
 
 
 # ── GitHub API helpers ────────────────────────────────────────────────────────
@@ -233,9 +271,15 @@ def store_in_graph(driver, repo_data: dict, analysis: dict, repo_owner_name: str
             MERGE (cb)-[:HAS_COMMIT]->(gc)
         """, sha=c["sha"], message=c["message"], date=c["date"], url=repo_data["url"])
 
+    # Normalize Claude's free-form skills to canonical SKILL_KEYWORDS names
+    canonical_skills = normalize_skills(
+        analysis.get("skills", []),
+        repo_data.get("languages", [])
+    )
+
     # Skill nodes + DEMONSTRATES relationships
     skills_added = 0
-    for skill in analysis.get("skills", []):
+    for skill in canonical_skills:
         skill = skill.strip()
         if not skill:
             continue
