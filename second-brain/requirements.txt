@@ -1,0 +1,15 @@
+playwright
+browser-use
+fastapi
+uvicorn
+arq
+redis
+pydantic
+python-telegram-bot
+anthropic
+fastembed
+qdrant-client
+sqlite-utils
+python-dotenv
+apscheduler
+httpx
