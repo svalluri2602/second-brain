@@ -1,0 +1,56 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+
+venv/
+venv310/
+__pycache__/
+*.pyc
+*.pyo
+.env
+auth.json
+bux.db
+node_modules/
+
+# databases — never push
+neo4j_data/
+qdrant_storage/
+graph_db/
+*.sqlite3
+
+# personal career data — never push
+career-ops/cv.md
+career-ops/data/
+career-ops/config/profile.yml
+career-ops/reports/
+career-ops/output/
+career-ops/jds/
+career-ops/batch/tracker-additions/
+career-ops/interview-prep/
+career-ops/article-digest.md
+career-ops/portals.yml
+
+# personal notes
+vault/
