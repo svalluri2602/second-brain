@@ -1,9 +1,12 @@
 """
-Hybrid RAG Chatbot — natural language queries over Neo4j + Qdrant.
+Hybrid RAG Chatbot — intelligent graph traversal over Neo4j + Qdrant.
 
-Neo4j  → structured graph (jobs, skills, companies, applications)
-Qdrant → semantic search (CV chunks, notes, articles)
-Claude → synthesizes both into a natural answer
+Design principles:
+- Pre-built traversal queries for every common question type (never fail)
+- Multi-hop graph traversal (Codebase → Skill → Role → Company)
+- Error tracking stored in graph (ErrorLog nodes)
+- Fall back to Qdrant semantic search when graph has no data
+- Claude synthesizes graph + vector results into grounded answers
 
 Usage:
   python3 -m agent.knowledge.chatbot
@@ -11,9 +14,10 @@ Usage:
 """
 
 import os
+import re
 import sys
+from datetime import date
 from typing import TypedDict, Optional
-from pathlib import Path
 
 from dotenv import load_dotenv
 from neo4j import GraphDatabase
@@ -31,7 +35,7 @@ NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASS = os.getenv("NEO4J_PASS", "secondbrain")
 
 
-# ── Neo4j helper ──────────────────────────────────────────────────────────────
+# ── Neo4j helpers ─────────────────────────────────────────────────────────────
 
 def neo4j_query(cypher: str, **params) -> list[dict]:
     driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
@@ -41,188 +45,272 @@ def neo4j_query(cypher: str, **params) -> list[dict]:
     return result
 
 
+def log_error(project: str, error_msg: str, fix: str = "", skill: str = ""):
+    """Store an error/fix in the graph for future learning."""
+    driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
+    with driver.session() as s:
+        s.run("""
+            MERGE (e:ErrorLog {error: $error, project: $project})
+            SET e.fix = $fix, e.date = $today, e.skill = $skill
+            WITH e
+            MATCH (cb:Codebase {name: $project})
+            MERGE (cb)-[:HAS_ERROR]->(e)
+        """, error=error_msg[:300], project=project,
+             fix=fix[:500], today=str(date.today()), skill=skill)
+    driver.close()
+
+
 # ── State ─────────────────────────────────────────────────────────────────────
 
 class ChatState(TypedDict):
-    question:      str
-    cypher:        Optional[str]
-    graph_results: list
+    question:       str
+    query_type:     str
+    cypher:         Optional[str]
+    graph_results:  list
     vector_results: list
-    answer:        str
-    history:       list   # list of {"role": ..., "content": ...}
+    answer:         str
+    history:        list
 
 
-# ── Nodes ─────────────────────────────────────────────────────────────────────
+# ── Pre-built traversal queries ───────────────────────────────────────────────
+# Each is a proven multi-hop Cypher query. Never generates bad Cypher.
 
-SCHEMA_CONTEXT = """
-Neo4j graph schema:
-- (Company {name}) -[:POSTED]-> (Role {url, title, location, date_seen, score, archetype})
-- (Role) -[:SURFACED_BY]-> (Portal {name})
-- (Role) -[:REQUIRES]-> (Skill {name})
-- (Application {num, date, company, role, score, status, notes})
-- (Codebase {url, name, description, languages, explanation, resume_bullets}) -[:DEMONSTRATES]-> (Skill)
-- (Codebase) -[:HAS_COMMIT]-> (GitCommit {sha, message, date})
+TRAVERSALS = {
 
-Canonical application statuses: Evaluated, Applied, Responded, Interview, Offer, Rejected, Discarded, SKIP
-
-Example queries:
-- All applications:
-  MATCH (a:Application) RETURN a.num, a.company, a.role, a.score, a.status ORDER BY a.score DESC
-
-- Skills my GitHub demonstrates:
-  MATCH (cb:Codebase)-[:DEMONSTRATES]->(s:Skill) RETURN cb.name AS repo, collect(s.name) AS skills
-
-- Gap detection (my GitHub skills vs job requirements — do NOT add Application joins):
-  MATCH (cb:Codebase)-[:DEMONSTRATES]->(ds:Skill)
-  MATCH (rs:Skill)<-[:REQUIRES]-(r:Role)
-  WHERE toLower(rs.name) CONTAINS toLower(ds.name) OR toLower(ds.name) CONTAINS toLower(rs.name)
-  RETURN rs.name AS skill, count(DISTINCT r) AS jobs_needing_it, collect(DISTINCT cb.name)[0..2] AS your_repos
-  ORDER BY jobs_needing_it DESC LIMIT 10
-
-- Companies by portal:
-  MATCH (c:Company)-[:POSTED]->(r:Role)-[:SURFACED_BY]->(p:Portal {name: 'greenhouse'})
-  RETURN c.name, r.title LIMIT 10
-
-- My codebases:
-  MATCH (cb:Codebase) RETURN cb.name, cb.explanation, cb.languages, cb.resume_bullets
-"""
-
-
-PREBUILT_QUERIES = {
+    # Your GitHub skills → jobs that need them (multi-hop)
     "gap": """
-        MATCH (cb:Codebase)-[:DEMONSTRATES]->(s:Skill)<-[:REQUIRES]-(r:Role)
-        RETURN s.name AS skill, count(DISTINCT r) AS jobs_needing_it,
-               collect(DISTINCT cb.name)[0..2] AS your_repos
+        MATCH (cb:Codebase)-[:DEMONSTRATES]->(s:Skill)<-[:REQUIRES]-(r:Role)<-[:POSTED]-(c:Company)
+        RETURN s.name AS skill,
+               count(DISTINCT r) AS jobs_needing_it,
+               collect(DISTINCT cb.name)[0..2] AS your_repos,
+               collect(DISTINCT c.name)[0..3] AS companies
         ORDER BY jobs_needing_it DESC LIMIT 15
     """,
+
+    # Full application pipeline with scores
     "applications": """
         MATCH (a:Application)
         RETURN a.num AS num, a.company AS company, a.role AS role,
                a.score AS score, a.status AS status, a.notes AS notes
         ORDER BY a.score DESC
     """,
+
+    # Your GitHub projects with full context
     "codebases": """
         MATCH (cb:Codebase)
+        OPTIONAL MATCH (cb)-[:DEMONSTRATES]->(s:Skill)
+        OPTIONAL MATCH (cb)-[:HAS_COMMIT]->(gc:GitCommit)
         RETURN cb.name AS name, cb.explanation AS explanation,
-               cb.languages AS languages, cb.resume_bullets AS bullets,
-               cb.complexity AS complexity
+               cb.technical_summary AS technical_summary,
+               cb.languages AS languages,
+               cb.resume_bullets AS bullets,
+               cb.complexity AS complexity,
+               cb.project_type AS type,
+               collect(DISTINCT s.name) AS skills,
+               count(DISTINCT gc) AS commit_count
     """,
-    "skills": """
+
+    # All skills demonstrated across repos
+    "my_skills": """
         MATCH (cb:Codebase)-[:DEMONSTRATES]->(s:Skill)
-        RETURN cb.name AS repo, collect(s.name) AS skills
+        WITH s.name AS skill, collect(DISTINCT cb.name) AS repos
+        RETURN skill, repos
+        ORDER BY size(repos) DESC, skill ASC
     """,
-    "companies": """
-        MATCH (c:Company)-[:POSTED]->(r:Role)
-        RETURN c.name AS company, count(r) AS roles
-        ORDER BY roles DESC LIMIT 20
+
+    # What skills do jobs in my pipeline require most
+    "job_skill_demand": """
+        MATCH (r:Role)-[:REQUIRES]->(s:Skill)
+        RETURN s.name AS skill, count(DISTINCT r) AS demand
+        ORDER BY demand DESC LIMIT 20
+    """,
+
+    # Multi-hop: path from my repos → matching companies
+    "matching_companies": """
+        MATCH (cb:Codebase)-[:DEMONSTRATES]->(s:Skill)<-[:REQUIRES]-(r:Role)<-[:POSTED]-(c:Company)
+        WITH c.name AS company, collect(DISTINCT s.name) AS matched_skills,
+             count(DISTINCT r) AS roles
+        RETURN company, matched_skills, roles
+        ORDER BY size(matched_skills) DESC LIMIT 15
+    """,
+
+    # Recent commits across all my repos
+    "recent_commits": """
+        MATCH (cb:Codebase)-[:HAS_COMMIT]->(gc:GitCommit)
+        RETURN cb.name AS repo, gc.message AS commit, gc.date AS date
+        ORDER BY gc.date DESC LIMIT 20
+    """,
+
+    # Errors logged on my projects
+    "errors": """
+        MATCH (cb:Codebase)-[:HAS_ERROR]->(e:ErrorLog)
+        RETURN cb.name AS project, e.error AS error,
+               e.fix AS fix, e.date AS date, e.skill AS skill
+        ORDER BY e.date DESC LIMIT 20
+    """,
+
+    # What's stale in my pipeline
+    "stale": """
+        MATCH (a:Application)
+        WHERE a.status IN ['Evaluated', 'Applied', 'Responded']
+        RETURN a.num AS num, a.company AS company, a.role AS role,
+               a.status AS status, a.date AS date, a.score AS score
+        ORDER BY a.date ASC
+    """,
+
+    # Skills I'm missing — in job demand but NOT in my repos
+    "missing_skills": """
+        MATCH (r:Role)-[:REQUIRES]->(s:Skill)
+        WHERE NOT EXISTS {
+            MATCH (cb:Codebase)-[:DEMONSTRATES]->(s)
+        }
+        RETURN s.name AS missing_skill, count(DISTINCT r) AS jobs_needing_it
+        ORDER BY jobs_needing_it DESC LIMIT 15
+    """,
+
+    # Full graph summary — what's in the graph
+    "summary": """
+        MATCH (c:Company) WITH count(c) AS companies
+        MATCH (r:Role)    WITH companies, count(r) AS roles
+        MATCH (a:Application) WITH companies, roles, count(a) AS apps
+        MATCH (s:Skill)   WITH companies, roles, apps, count(s) AS skills
+        MATCH (cb:Codebase) WITH companies, roles, apps, skills, count(cb) AS codebases
+        RETURN companies, roles, apps, skills, codebases
     """,
 }
 
-def _route_prebuilt(question: str) -> str | None:
+
+# ── Query router ──────────────────────────────────────────────────────────────
+
+ROUTE_MAP = [
+    (["gap", "match", "qualify", "fit for", "what jobs", "missing skill"],           "gap"),
+    (["application", "applied", "pipeline", "status", "score", "offer", "rejected"], "applications"),
+    (["stale", "follow up", "no reply", "cold", "overdue"],                          "stale"),
+    (["built", "project", "codebase", "repo", "github", "explain my"],               "codebases"),
+    (["my skill", "what i know", "what can i do", "my stack", "technologies i"],     "my_skills"),
+    (["missing", "don't have", "lack", "should learn", "need to learn"],             "missing_skills"),
+    (["compan", "who is hiring", "which companies", "employers"],                     "matching_companies"),
+    (["commit", "recent work", "what have i worked"],                                 "recent_commits"),
+    (["error", "bug", "fix", "problem", "issue", "mistake"],                         "errors"),
+    (["demand", "most wanted", "popular skill", "trending"],                         "job_skill_demand"),
+    (["summary", "overview", "how many", "stats", "total"],                          "summary"),
+]
+
+
+def route_query(question: str) -> tuple[str, str]:
+    """Return (query_type, cypher). Falls back to LLM generation."""
     q = question.lower()
-    if any(w in q for w in ["gap", "match", "require", "need", "missing", "qualify"]):
-        return PREBUILT_QUERIES["gap"]
-    if any(w in q for w in ["application", "applied", "pipeline", "status", "score"]):
-        return PREBUILT_QUERIES["applications"]
-    if any(w in q for w in ["built", "project", "codebase", "repo", "github"]):
-        return PREBUILT_QUERIES["codebases"]
-    if any(w in q for w in ["skill", "technology", "stack", "know", "experience"]):
-        return PREBUILT_QUERIES["skills"]
-    if any(w in q for w in ["compan", "employer", "who is hiring"]):
-        return PREBUILT_QUERIES["companies"]
-    return None
+    for keywords, qtype in ROUTE_MAP:
+        if any(kw in q for kw in keywords):
+            return qtype, TRAVERSALS[qtype]
+    return "generated", ""
+
+
+# ── LangGraph nodes ───────────────────────────────────────────────────────────
+
+SCHEMA_HINT = """
+Neo4j schema (ONLY use these nodes and relationships):
+Nodes: Company{name}, Role{url,title,location,date_seen}, Portal{name},
+       Skill{name}, Application{num,date,company,role,score,status,notes},
+       Codebase{url,name,description,languages,explanation,resume_bullets},
+       GitCommit{sha,message,date}, ErrorLog{error,fix,date,project,skill}
+
+Relationships:
+(Company)-[:POSTED]->(Role)
+(Role)-[:SURFACED_BY]->(Portal)
+(Role)-[:REQUIRES]->(Skill)
+(Codebase)-[:DEMONSTRATES]->(Skill)
+(Codebase)-[:HAS_COMMIT]->(GitCommit)
+(Codebase)-[:HAS_ERROR]->(ErrorLog)
+
+Rules: ONLY these relationships. Always LIMIT 20. Use toLower() for text matching.
+"""
 
 
 def generate_cypher_node(state: ChatState) -> dict:
-    """Route to pre-built Cypher or generate dynamically."""
-    prebuilt = _route_prebuilt(state["question"])
-    if prebuilt:
-        return {"cypher": prebuilt}
+    qtype, cypher = route_query(state["question"])
 
+    if cypher:
+        return {"query_type": qtype, "cypher": cypher}
+
+    # LLM fallback for unknown questions
     response = client.messages.create(
         model="claude-haiku-4-5-20251001",
-        max_tokens=400,
-        messages=[{
-            "role": "user",
-            "content": f"""{SCHEMA_CONTEXT}
-
-Convert this question to a Cypher query. Return ONLY the Cypher, nothing else.
-If unanswerable from the graph, return: SKIP
-
-Question: {state['question']}
-
-Rules:
-- ONLY use relationships defined in the schema above
-- LIMIT to 20 max
-- toLower() for string matching"""
-        }]
+        max_tokens=300,
+        messages=[{"role": "user", "content": f"""{SCHEMA_HINT}
+Write a Cypher query for: {state['question']}
+Return ONLY the Cypher. If unanswerable from schema, return: SKIP"""}]
     )
-    cypher = response.content[0].text.strip()
-    if "```" in cypher:
-        cypher = cypher.split("```")[1]
-        if cypher.lower().startswith("cypher"):
-            cypher = cypher[6:]
-        cypher = cypher.strip()
-    return {"cypher": cypher}
+    raw = response.content[0].text.strip()
+    if "```" in raw:
+        raw = raw.split("```")[1]
+        raw = re.sub(r"^(cypher|sql)\s*", "", raw, flags=re.IGNORECASE).strip()
+    return {"query_type": "generated", "cypher": raw}
 
 
 def neo4j_search_node(state: ChatState) -> dict:
-    """Run the Cypher query against Neo4j."""
-    if not state["cypher"] or state["cypher"] == "SKIP":
+    if not state.get("cypher") or state["cypher"].strip().upper() == "SKIP":
         return {"graph_results": []}
     try:
         results = neo4j_query(state["cypher"])
         return {"graph_results": results[:20]}
     except Exception as e:
-        return {"graph_results": [{"error": str(e)}]}
+        return {"graph_results": [{"_query_error": str(e)[:200]}]}
 
 
 def qdrant_search_node(state: ChatState) -> dict:
-    """Semantic search on CV + stored content."""
     try:
-        results = search_relevant(state["question"], limit=3)
-        return {"vector_results": results}
+        return {"vector_results": search_relevant(state["question"], limit=3)}
     except Exception:
         return {"vector_results": []}
 
 
 def synthesize_node(state: ChatState) -> dict:
-    """Combine graph + vector results and generate final answer."""
-    graph_str  = str(state["graph_results"])  if state["graph_results"]  else "No graph results."
-    vector_str = "\n---\n".join(state["vector_results"]) if state["vector_results"] else "No CV context."
+    graph_data   = state["graph_results"]
+    vector_data  = state["vector_results"]
+    query_type   = state.get("query_type", "")
 
-    history = state.get("history", [])
-    messages = history + [{
+    has_graph    = graph_data and "_query_error" not in str(graph_data)
+    has_vector   = bool(vector_data)
+
+    graph_str    = str(graph_data) if has_graph else "No graph data returned."
+    vector_str   = "\n---\n".join(vector_data) if has_vector else "No CV context."
+
+    system_prompt = """You are Satwik Valluri's personal career AI with full access to his graph.
+Satwik is a CS senior at Virginia Tech graduating December 2026. He's targeting AI agent engineering internships and full-time roles.
+
+When the graph returns data: use it directly, be specific, cite companies/skills/scores by name.
+When the graph is empty: say so clearly but still help using CV context.
+Never make up graph data. Never be generic when you have specifics.
+Format with markdown. Be concise but complete."""
+
+    messages = state.get("history", []) + [{
         "role": "user",
-        "content": f"""You are a personal career AI assistant for Satwik Valluri, CS senior at Virginia Tech graduating Dec 2026.
-You have access to his full career graph and CV.
+        "content": f"""Question: {state['question']}
 
-Question: {state['question']}
+Query type: {query_type}
 
-Graph data (Neo4j):
+Graph data (Neo4j traversal):
 {graph_str}
 
-CV context (semantic search):
+CV/semantic context (Qdrant):
 {vector_str}
 
-Answer naturally and helpfully. Be specific — use real data from above.
-If graph data is empty or irrelevant, rely on CV context.
-Keep it concise unless they ask for detail."""
+Answer grounded in the data above."""
     }]
 
     response = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=800,
+        max_tokens=1000,
+        system=system_prompt,
         messages=messages
     )
 
     answer = response.content[0].text.strip()
-
-    updated_history = history + [
+    updated_history = state.get("history", []) + [
         {"role": "user",      "content": state["question"]},
-        {"role": "assistant", "content": answer}
+        {"role": "assistant", "content": answer},
     ]
-
     return {"answer": answer, "history": updated_history}
 
 
@@ -230,25 +318,39 @@ Keep it concise unless they ask for detail."""
 
 def build_chatbot():
     g = StateGraph(ChatState)
-    g.add_node("generate_cypher", generate_cypher_node)
-    g.add_node("neo4j_search",    neo4j_search_node)
-    g.add_node("qdrant_search",   qdrant_search_node)
-    g.add_node("synthesize",      synthesize_node)
+    g.add_node("route",     generate_cypher_node)
+    g.add_node("graph",     neo4j_search_node)
+    g.add_node("vector",    qdrant_search_node)
+    g.add_node("synthesize", synthesize_node)
 
-    g.set_entry_point("generate_cypher")
-    g.add_edge("generate_cypher", "neo4j_search")
-    g.add_edge("generate_cypher", "qdrant_search")
-    g.add_edge("neo4j_search",    "synthesize")
-    g.add_edge("qdrant_search",   "synthesize")
-    g.add_edge("synthesize",      END)
+    g.set_entry_point("route")
+    g.add_edge("route",   "graph")
+    g.add_edge("route",   "vector")
+    g.add_edge("graph",   "synthesize")
+    g.add_edge("vector",  "synthesize")
+    g.add_edge("synthesize", END)
     return g.compile()
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
+
+def ask(question: str, history: list = None) -> str:
+    """Single-shot query. Returns answer string."""
+    bot = build_chatbot()
+    state = bot.invoke({
+        "question": question, "query_type": "",
+        "cypher": None, "graph_results": [],
+        "vector_results": [], "answer": "",
+        "history": history or [],
+    })
+    return state["answer"]
 
 
 # ── REPL ─────────────────────────────────────────────────────────────────────
 
 def run_chat():
-    print("Career AI — ask me anything about your pipeline, skills, or jobs.")
-    print("Type 'quit' to exit.\n")
+    print("Career AI — ask me anything about your graph, skills, jobs, or code.")
+    print("Commands: 'errors' to log an error, 'quit' to exit.\n")
 
     bot     = build_chatbot()
     history = []
@@ -265,12 +367,10 @@ def run_chat():
             break
 
         state = bot.invoke({
-            "question":       question,
-            "cypher":         None,
-            "graph_results":  [],
-            "vector_results": [],
-            "answer":         "",
-            "history":        history,
+            "question": question, "query_type": "",
+            "cypher": None, "graph_results": [],
+            "vector_results": [], "answer": "",
+            "history": history,
         })
 
         print(f"\nAI: {state['answer']}\n")
@@ -281,13 +381,6 @@ def run_chat():
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
-        question = " ".join(sys.argv[1:])
-        bot = build_chatbot()
-        state = bot.invoke({
-            "question": question, "cypher": None,
-            "graph_results": [], "vector_results": [],
-            "answer": "", "history": [],
-        })
-        print(state["answer"])
+        print(ask(" ".join(sys.argv[1:])))
     else:
         run_chat()

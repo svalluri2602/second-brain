@@ -45,6 +45,7 @@ def init_schema(driver):
         "CREATE CONSTRAINT IF NOT EXISTS FOR (p:Portal)      REQUIRE p.name       IS UNIQUE",
         "CREATE CONSTRAINT IF NOT EXISTS FOR (o:Outreach)    REQUIRE o.id         IS UNIQUE",
         "CREATE CONSTRAINT IF NOT EXISTS FOR (s:Skill)       REQUIRE s.name       IS UNIQUE",
+        "CREATE CONSTRAINT IF NOT EXISTS FOR (e:ErrorLog)    REQUIRE e.error      IS UNIQUE",
     ]
     for c in constraints:
         run(driver, c)
