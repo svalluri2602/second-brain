@@ -54,3 +54,25 @@ career-ops/portals.yml
 
 # personal notes
 vault/
+
+# frontend / tauri — not part of the Python agent
+src/
+src-tauri/
+public/
+index.html
+package.json
+package-lock.json
+tsconfig.json
+tsconfig.node.json
+vite.config.ts
+*.lock
+
+# nested repos and dirs
+career-ops/
+second-brain/
+graph_db
+graph_db/
+
+# misc
+README.md
+.vscode/
